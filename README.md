@@ -1,73 +1,144 @@
-# Go Implementation of [WireGuard](https://www.wireguard.com/)
+# wireguard-quic
 
-This is an implementation of WireGuard in Go.
+A fork of [wireguard-go](https://git.zx2c4.com/wireguard-go) with QUIC-over-raw-TCP transport for bypassing Deep Packet Inspection (DPI).
 
-## Usage
+## What is this?
 
-Most Linux kernel WireGuard users are used to adding an interface with `ip link add wg0 type wireguard`. With wireguard-go, instead simply run:
+wireguard-quic wraps WireGuard traffic inside QUIC streams carried over raw TCP sockets, making it indistinguishable from normal HTTPS/HTTP3 web traffic to DPI systems.
 
-```
-$ wireguard-go wg0
-```
-
-This will create an interface and fork into the background. To remove the interface, use the usual `ip link del wg0`, or if your system does not support removing interfaces directly, you may instead remove the control socket via `rm -f /var/run/wireguard/wg0.sock`, which will result in wireguard-go shutting down.
-
-To run wireguard-go without forking to the background, pass `-f` or `--foreground`:
+The transport stack:
 
 ```
-$ wireguard-go -f wg0
+WireGuard Packet
+      |
+  QUIC Stream (TLS 1.3, h3 ALPN)
+      |
+  Raw TCP Packets (crafted headers, bypasses OS TCP stack)
+      |
+  Network — DPI sees normal HTTPS traffic
 ```
 
-When an interface is running, you may use [`wg(8)`](https://git.zx2c4.com/wireguard-tools/about/src/man/wg.8) to configure it, as well as the usual `ip(8)` and `ifconfig(8)` commands.
+## Features
 
-To run with more logging you may set the environment variable `LOG_LEVEL=debug`.
+- **DPI bypass** — Traffic appears as standard HTTPS/HTTP3 on port 443
+- **Raw TCP injection** — Bypasses OS TCP stack, crafts realistic TCP headers
+- **TLS 1.3 encryption** — Full QUIC with h3 ALPN on top of WireGuard encryption
+- **Multi-stream QUIC** — Multiple QUIC connections with multiple streams each for throughput
+- **Auto-detection** — Automatically detects network interface, IP, and gateway MAC
+- **Cross-platform** — Linux (AF_PACKET), macOS (libpcap), Windows (Npcap)
+- **Config file driven** — INI-format config at `/etc/wireguard/<interface>.quictcp.conf`
 
-## Platforms
+## Quick Start
+
+### Build
+
+Requires [Go](https://go.dev/) 1.24+.
+
+```bash
+# Linux (static binary, no CGO)
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o wireguard-quic-linux-amd64 -ldflags="-s -w"
+
+# macOS
+go build -o wireguard-quic-darwin-amd64
+
+# Or use make
+make
+```
+
+### Server (Linux)
+
+1. Create `/etc/wireguard/wg0.quictcp.conf`:
+
+```ini
+[QuicTcp]
+Enabled = true
+Key = <shared-secret>
+IsServer = true
+LocalPort = 443
+AutoDetect = true
+Backend = afpacket
+```
+
+2. Block RST packets and start:
+
+```bash
+sudo iptables -A OUTPUT -p tcp --sport 443 --tcp-flags RST RST -j DROP
+sudo wireguard-quic wg0
+```
+
+3. Configure WireGuard as usual with `wg setconf`.
+
+### Client (macOS/Linux)
+
+1. Create `/etc/wireguard/wg0.quictcp.conf`:
+
+```ini
+[QuicTcp]
+Enabled = true
+Key = <shared-secret>
+Server = your.server.ip:443
+AutoDetect = true
+LocalPort = 0
+```
+
+2. Start:
+
+```bash
+sudo wireguard-quic wg0
+```
+
+Or use the helper script for one-command setup:
+
+```bash
+sudo wgq-quick up wg0      # start (background)
+sudo wgq-quick -f up wg0   # start (foreground with logs)
+sudo wgq-quick down wg0    # stop
+```
+
+## Configuration
+
+QUIC-TCP is configured via INI files or environment variables. See [QUICTCP-USAGE.md](QUICTCP-USAGE.md) for the full reference, and [configs/](configs/) for sample configurations.
+
+### Config file locations (searched in order)
+
+1. `WG_QUICTCP_CONFIG` environment variable
+2. `/etc/wireguard/<interface>.quictcp.conf`
+3. `/etc/wireguard/<interface>.quictcp`
+4. `~/.config/wireguard/<interface>.quictcp.conf`
+
+## Requirements
+
+- **Root/Administrator privileges** — Required for raw socket access
+- **Linux**: No external dependencies (uses AF_PACKET)
+- **macOS**: libpcap (included with macOS)
+- **Windows**: [Npcap](https://npcap.com/)
+- **Server-side**: Must block RST packets on the QUIC-TCP port
+
+## Platform Notes
 
 ### Linux
-
-This will run on Linux; however you should instead use the kernel module, which is faster and better integrated into the OS. See the [installation page](https://www.wireguard.com/install/) for instructions.
+Uses AF_PACKET for zero-dependency raw socket access. For standard WireGuard without DPI bypass, use the kernel module instead — see [wireguard.com/install](https://www.wireguard.com/install/).
 
 ### macOS
-
-This runs on macOS using the utun driver. It does not yet support sticky sockets, and won't support fwmarks because of Darwin limitations. Since the utun driver cannot have arbitrary interface names, you must either use `utun[0-9]+` for an explicit interface name or `utun` to have the kernel select one for you. If you choose `utun` as the interface name, and the environment variable `WG_TUN_NAME_FILE` is defined, then the actual name of the interface chosen by the kernel is written to the file specified by that variable.
+Uses utun driver. Interface names must be `utun[0-9]+` or `utun` for kernel auto-assignment.
 
 ### Windows
-
-This runs on Windows, but you should instead use it from the more [fully featured Windows app](https://git.zx2c4.com/wireguard-windows/about/), which uses this as a module.
-
-### FreeBSD
-
-This will run on FreeBSD. It does not yet support sticky sockets. Fwmark is mapped to `SO_USER_COOKIE`.
-
-### OpenBSD
-
-This will run on OpenBSD. It does not yet support sticky sockets. Fwmark is mapped to `SO_RTABLE`. Since the tun driver cannot have arbitrary interface names, you must either use `tun[0-9]+` for an explicit interface name or `tun` to have the program select one for you. If you choose `tun` as the interface name, and the environment variable `WG_TUN_NAME_FILE` is defined, then the actual name of the interface chosen by the kernel is written to the file specified by that variable.
-
-## Building
-
-This requires an installation of the latest version of [Go](https://go.dev/).
-
-```
-$ git clone https://git.zx2c4.com/wireguard-go
-$ cd wireguard-go
-$ make
-```
+Uses Npcap for raw socket access. For standard WireGuard, use the [Windows app](https://git.zx2c4.com/wireguard-windows/about/).
 
 ## License
 
     Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
-    
+
     Permission is hereby granted, free of charge, to any person obtaining a copy of
     this software and associated documentation files (the "Software"), to deal in
     the Software without restriction, including without limitation the rights to
     use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
     of the Software, and to permit persons to whom the Software is furnished to do
     so, subject to the following conditions:
-    
+
     The above copyright notice and this permission notice shall be included in all
     copies or substantial portions of the Software.
-    
+
     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
     IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
     FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE

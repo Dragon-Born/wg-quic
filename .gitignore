@@ -1,1 +1,4 @@
 wireguard-go
+wireguard-quic
+wireguard-quic-*
+wireguard-go-*

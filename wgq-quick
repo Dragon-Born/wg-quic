@@ -1,0 +1,562 @@
+#!/bin/bash
+# wgq-quick - A wg-quick equivalent for wireguard-quic
+# Usage: wgq-quick [-f] up|down <interface>
+
+set -e
+
+PROGRAM="${0##*/}"
+ARGS=( "$@" )
+
+cmd() {
+    echo "[#] $*" >&2
+    "$@"
+}
+
+die() {
+    echo "$PROGRAM: $*" >&2
+    exit 1
+}
+
+# Detect OS once
+OS="$(uname)"
+is_macos() { [[ "$OS" == "Darwin" ]]; }
+is_linux() { [[ "$OS" == "Linux" ]]; }
+
+# Global variables
+CONFIG_FILE=""
+INTERFACE=""
+ACTUAL_INTERFACE=""
+ADDRESSES=()
+MTU=""
+DNS=()
+TABLE=""
+PRE_UP=()
+POST_UP=()
+PRE_DOWN=()
+POST_DOWN=()
+SAVE_CONFIG=0
+CONFIG_FILE_CONTENTS=""
+FOREGROUND=0
+LISTEN_PORT=""  # WireGuard listen port (for RST blocking)
+QUICTCP_PORT="" # QUICTCP port (for RST blocking on server)
+
+parse_options() {
+    local interface_section=0 peer_section=0
+    local line key value stripped
+
+    CONFIG_FILE_CONTENTS=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Remove carriage returns (Windows line endings)
+        line="${line//$'\r'/}"
+
+        # Remove comments and leading/trailing whitespace
+        stripped="${line%%#*}"
+        stripped="${stripped#"${stripped%%[![:space:]]*}"}"
+        stripped="${stripped%"${stripped##*[![:space:]]}"}"
+
+        [[ -z "$stripped" ]] && continue
+
+        # Check section headers
+        if [[ "$stripped" =~ ^\[Interface\]$ ]]; then
+            interface_section=1
+            peer_section=0
+            CONFIG_FILE_CONTENTS+="[Interface]"$'\n'
+            continue
+        elif [[ "$stripped" =~ ^\[Peer\]$ ]]; then
+            interface_section=0
+            peer_section=1
+            CONFIG_FILE_CONTENTS+="[Peer]"$'\n'
+            continue
+        fi
+
+        # Parse key = value
+        if [[ "$stripped" =~ ^([^=]+)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            # Trim whitespace
+            key="${key#"${key%%[![:space:]]*}"}"
+            key="${key%"${key##*[![:space:]]}"}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+
+            if [[ $interface_section -eq 1 ]]; then
+                case "$key" in
+                    Address)
+                        IFS=',' read -ra addrs <<< "$value"
+                        for addr in "${addrs[@]}"; do
+                            addr="${addr#"${addr%%[![:space:]]*}"}"
+                            addr="${addr%"${addr##*[![:space:]]}"}"
+                            ADDRESSES+=("$addr")
+                        done
+                        ;;
+                    MTU)
+                        MTU="$value"
+                        ;;
+                    DNS)
+                        IFS=',' read -ra dns_servers <<< "$value"
+                        for dns in "${dns_servers[@]}"; do
+                            dns="${dns#"${dns%%[![:space:]]*}"}"
+                            dns="${dns%"${dns##*[![:space:]]}"}"
+                            DNS+=("$dns")
+                        done
+                        ;;
+                    Table)
+                        TABLE="$value"
+                        ;;
+                    PreUp)
+                        PRE_UP+=("$value")
+                        ;;
+                    PostUp)
+                        POST_UP+=("$value")
+                        ;;
+                    PreDown)
+                        PRE_DOWN+=("$value")
+                        ;;
+                    PostDown)
+                        POST_DOWN+=("$value")
+                        ;;
+                    SaveConfig)
+                        [[ "$value" == "true" ]] && SAVE_CONFIG=1
+                        ;;
+                    ListenPort)
+                        LISTEN_PORT="$value"
+                        CONFIG_FILE_CONTENTS+="$key = $value"$'\n'
+                        ;;
+                    PrivateKey|FwMark)
+                        CONFIG_FILE_CONTENTS+="$key = $value"$'\n'
+                        ;;
+                esac
+            elif [[ $peer_section -eq 1 ]]; then
+                CONFIG_FILE_CONTENTS+="$key = $value"$'\n'
+            fi
+        fi
+    done < "$CONFIG_FILE"
+}
+
+# Parse QUICTCP config to get the local port
+parse_quictcp_config() {
+    local quictcp_config="/etc/wireguard/${INTERFACE}.quictcp.conf"
+    if [[ -f "$quictcp_config" ]]; then
+        export WG_QUICTCP_CONFIG="$quictcp_config"
+        echo "[#] Using QUICTCP config: $quictcp_config" >&2
+        # Extract LocalPort for RST blocking
+        QUICTCP_PORT=$(grep -E '^LocalPort\s*=' "$quictcp_config" 2>/dev/null | sed 's/.*=\s*//' | tr -d ' ')
+    fi
+}
+
+add_addr() {
+    local addr="$1"
+    local ip="${addr%/*}"
+    local prefix="${addr#*/}"
+
+    if is_macos; then
+        if [[ "$addr" == *:* ]]; then
+            cmd ifconfig "$ACTUAL_INTERFACE" inet6 "$ip" prefixlen "$prefix"
+        else
+            local netmask
+            case "$prefix" in
+                32) netmask="255.255.255.255" ;;
+                31) netmask="255.255.255.254" ;;
+                30) netmask="255.255.255.252" ;;
+                29) netmask="255.255.255.248" ;;
+                28) netmask="255.255.255.240" ;;
+                27) netmask="255.255.255.224" ;;
+                26) netmask="255.255.255.192" ;;
+                25) netmask="255.255.255.128" ;;
+                24) netmask="255.255.255.0" ;;
+                16) netmask="255.255.0.0" ;;
+                8)  netmask="255.0.0.0" ;;
+                *)  netmask="255.255.255.255" ;;
+            esac
+            cmd ifconfig "$ACTUAL_INTERFACE" inet "$ip" "$ip" netmask "$netmask"
+        fi
+    else
+        if [[ "$addr" == *:* ]]; then
+            cmd ip -6 addr add "$addr" dev "$ACTUAL_INTERFACE"
+        else
+            cmd ip -4 addr add "$addr" dev "$ACTUAL_INTERFACE"
+        fi
+    fi
+}
+
+set_mtu() {
+    if [[ -n "$MTU" ]]; then
+        if is_macos; then
+            cmd ifconfig "$ACTUAL_INTERFACE" mtu "$MTU"
+        else
+            cmd ip link set mtu "$MTU" dev "$ACTUAL_INTERFACE"
+        fi
+    fi
+}
+
+set_dns() {
+    [[ ${#DNS[@]} -eq 0 ]] && return
+
+    if is_macos; then
+        echo "d.init
+d.add ServerAddresses * ${DNS[*]}
+set State:/Network/Service/wireguard-quic/DNS
+quit" | scutil
+        echo "[#] DNS set to: ${DNS[*]}" >&2
+    else
+        if command -v resolvconf &>/dev/null; then
+            printf 'nameserver %s\n' "${DNS[@]}" | cmd resolvconf -a "tun.$ACTUAL_INTERFACE" -m 0 -x
+        elif command -v systemd-resolve &>/dev/null; then
+            cmd systemd-resolve -i "$ACTUAL_INTERFACE" "${DNS[@]/#/--set-dns=}"
+        else
+            echo "Warning: No DNS resolver found (resolvconf or systemd-resolve)" >&2
+        fi
+    fi
+}
+
+unset_dns() {
+    [[ ${#DNS[@]} -eq 0 ]] && return
+
+    if is_macos; then
+        echo "d.init
+remove State:/Network/Service/wireguard-quic/DNS
+quit" | scutil 2>/dev/null || true
+    else
+        if command -v resolvconf &>/dev/null; then
+            resolvconf -d "tun.$ACTUAL_INTERFACE" -f 2>/dev/null || true
+        fi
+    fi
+}
+
+# Block RST packets - critical for raw TCP to work on server
+setup_rst_blocking() {
+    # Determine the port to block RST on
+    local port="${QUICTCP_PORT:-$LISTEN_PORT}"
+    [[ -z "$port" ]] && return
+
+    if is_macos; then
+        local phys_iface=$(route -n get default 2>/dev/null | grep 'interface:' | awk '{print $2}')
+        if [[ -n "$phys_iface" ]]; then
+            echo "[#] Blocking RST packets on port $port (pf)" >&2
+            echo "block out quick on $phys_iface proto tcp from any port $port flags R/R" | \
+                pfctl -a "com.wireguard-quic" -f - 2>/dev/null || true
+            pfctl -e 2>/dev/null || true
+        fi
+    else
+        echo "[#] Blocking RST packets on port $port (iptables)" >&2
+        iptables -C OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || \
+            iptables -I OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
+        ip6tables -C OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || \
+            ip6tables -I OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
+    fi
+}
+
+# Remove RST blocking rules
+cleanup_rst_blocking() {
+    local port="${QUICTCP_PORT:-$LISTEN_PORT}"
+
+    if is_macos; then
+        pfctl -a "com.wireguard-quic" -F all 2>/dev/null || true
+    else
+        if [[ -n "$port" ]]; then
+            iptables -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || true
+            ip6tables -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || true
+        fi
+    fi
+}
+
+# Wait for interface to appear
+wait_for_interface() {
+    local retries=20
+    echo "[#] Waiting for interface..." >&2
+
+    if is_macos; then
+        while [[ $retries -gt 0 ]]; do
+            ACTUAL_INTERFACE=$(wg show interfaces 2>/dev/null | grep -E '^utun[0-9]+$' | tail -1)
+            [[ -n "$ACTUAL_INTERFACE" ]] && ifconfig "$ACTUAL_INTERFACE" &>/dev/null && return 0
+            sleep 0.5
+            ((retries--))
+        done
+        # Fallback: find newest utun
+        ACTUAL_INTERFACE=$(ifconfig -l | tr ' ' '\n' | grep -E '^utun[0-9]+$' | tail -1)
+        [[ -n "$ACTUAL_INTERFACE" ]] && ifconfig "$ACTUAL_INTERFACE" &>/dev/null && return 0
+    else
+        ACTUAL_INTERFACE="$INTERFACE"
+        while [[ $retries -gt 0 ]]; do
+            ip link show dev "$ACTUAL_INTERFACE" &>/dev/null && return 0
+            sleep 0.5
+            ((retries--))
+        done
+    fi
+    return 1
+}
+
+# Configure the interface after it's created
+configure_interface() {
+    local tmpfile=$(mktemp)
+    echo "$CONFIG_FILE_CONTENTS" > "$tmpfile"
+    cmd wg setconf "$ACTUAL_INTERFACE" "$tmpfile"
+    rm -f "$tmpfile"
+
+    set_mtu
+
+    for addr in "${ADDRESSES[@]}"; do
+        add_addr "$addr"
+    done
+
+    if is_macos; then
+        cmd ifconfig "$ACTUAL_INTERFACE" up
+        cmd route -n add -net 0.0.0.0/1 -interface "$ACTUAL_INTERFACE" 2>/dev/null || true
+        cmd route -n add -net 128.0.0.0/1 -interface "$ACTUAL_INTERFACE" 2>/dev/null || true
+    else
+        cmd ip link set "$ACTUAL_INTERFACE" up
+    fi
+
+    set_dns
+
+    for postup in "${POST_UP[@]}"; do
+        cmd bash -c "$postup"
+    done
+
+    echo "[#] $ACTUAL_INTERFACE configured and up!" >&2
+}
+
+# Clean up interface and related resources
+cleanup_interface() {
+    echo "[#] Cleaning up..." >&2
+
+    # Run PreDown commands
+    for predown in "${PRE_DOWN[@]}"; do
+        bash -c "$predown" 2>/dev/null || true
+    done
+
+    if is_macos; then
+        route -n delete -net 0.0.0.0/1 -interface "$ACTUAL_INTERFACE" 2>/dev/null || true
+        route -n delete -net 128.0.0.0/1 -interface "$ACTUAL_INTERFACE" 2>/dev/null || true
+    else
+        if ip link show dev "$ACTUAL_INTERFACE" &>/dev/null; then
+            ip link set "$ACTUAL_INTERFACE" down 2>/dev/null || true
+            ip link delete dev "$ACTUAL_INTERFACE" 2>/dev/null || true
+        fi
+    fi
+
+    unset_dns
+    cleanup_rst_blocking
+
+    for postdown in "${POST_DOWN[@]}"; do
+        bash -c "$postdown" 2>/dev/null || true
+    done
+
+    echo "[#] Done" >&2
+}
+
+cmd_up() {
+    [[ -z "$CONFIG_FILE" ]] && die "Configuration file not specified"
+    [[ ! -f "$CONFIG_FILE" ]] && die "Configuration file '$CONFIG_FILE' does not exist"
+
+    parse_options
+    parse_quictcp_config
+
+    # Check if already running
+    if is_macos; then
+        local wg_pids=$(pgrep -f "[w]ireguard-quic utun" 2>/dev/null || true)
+        if [[ -n "$wg_pids" ]]; then
+            die "wireguard-quic is already running (pid: $wg_pids). Use '$PROGRAM down $INTERFACE' first."
+        fi
+    else
+        if ip link show dev "$INTERFACE" &>/dev/null; then
+            die "'$INTERFACE' already exists"
+        fi
+    fi
+
+    # Run PreUp commands
+    for preup in "${PRE_UP[@]}"; do
+        cmd bash -c "$preup"
+    done
+
+    # Determine TUN name
+    local tun_name="$INTERFACE"
+    is_macos && tun_name="utun"
+
+    # Block RST packets BEFORE starting wireguard-quic (critical for raw TCP)
+    setup_rst_blocking
+
+    if [[ $FOREGROUND -eq 1 ]]; then
+        # Foreground mode: run wireguard-quic with -f flag
+        echo "[#] Starting wireguard-quic in foreground mode..." >&2
+        wireguard-quic -f "$tun_name" &
+        local wg_pid=$!
+
+        if ! wait_for_interface; then
+            echo "[#] ERROR: Interface not found" >&2
+            kill -9 $wg_pid 2>/dev/null || true
+            cleanup_rst_blocking
+            exit 1
+        fi
+
+        echo "[#] Interface $ACTUAL_INTERFACE is up" >&2
+        configure_interface
+
+        echo "[#] wireguard-quic running (pid $wg_pid), press Ctrl+C to stop..." >&2
+
+        # Cleanup on exit
+        CLEANUP_DONE=0
+        cleanup_foreground() {
+            [[ $CLEANUP_DONE -eq 1 ]] && return
+            CLEANUP_DONE=1
+            trap - INT TERM
+            echo "" >&2
+            kill -9 $wg_pid 2>/dev/null || true
+            pkill -9 -f "wireguard-quic.*$ACTUAL_INTERFACE" 2>/dev/null || true
+            sleep 0.3
+            cleanup_interface
+        }
+        trap cleanup_foreground INT TERM
+
+        wait $wg_pid 2>/dev/null || true
+        cleanup_foreground
+        exit 0
+    else
+        # Background mode: daemonize wireguard-quic properly
+        echo "[#] Starting wireguard-quic in background..." >&2
+
+        # Use nohup and redirect output to log file
+        local log_file="/var/log/wireguard-quic-${INTERFACE}.log"
+        nohup wireguard-quic "$tun_name" > "$log_file" 2>&1 &
+        local wg_pid=$!
+        disown $wg_pid 2>/dev/null || true
+
+        # Save PID for later
+        echo $wg_pid > "/var/run/wireguard-quic-${INTERFACE}.pid" 2>/dev/null || true
+
+        if ! wait_for_interface; then
+            echo "[#] ERROR: Interface not found" >&2
+            kill -9 $wg_pid 2>/dev/null || true
+            cleanup_rst_blocking
+            exit 1
+        fi
+
+        echo "[#] Interface $ACTUAL_INTERFACE is up" >&2
+        configure_interface
+
+        echo "[#] wireguard-quic running in background (pid $wg_pid)" >&2
+        echo "[#] Logs: $log_file" >&2
+    fi
+}
+
+cmd_down() {
+    [[ -z "$CONFIG_FILE" ]] && die "Configuration file not specified"
+
+    parse_options
+    parse_quictcp_config
+
+    # Find the actual interface
+    if is_macos; then
+        ACTUAL_INTERFACE=$(wg show interfaces 2>/dev/null | grep -E '^utun[0-9]+$' | head -1)
+        if [[ -z "$ACTUAL_INTERFACE" ]]; then
+            die "No active WireGuard interface found"
+        fi
+    else
+        ACTUAL_INTERFACE="$INTERFACE"
+        if ! ip link show dev "$ACTUAL_INTERFACE" &>/dev/null; then
+            die "'$ACTUAL_INTERFACE' does not exist"
+        fi
+    fi
+
+    echo "[#] Bringing down $ACTUAL_INTERFACE..." >&2
+
+    # Kill wireguard-quic daemon
+    if is_macos; then
+        pkill -9 -f "wireguard-quic.*utun" 2>/dev/null || true
+    else
+        # Try PID file first
+        local pid_file="/var/run/wireguard-quic-${INTERFACE}.pid"
+        if [[ -f "$pid_file" ]]; then
+            local pid=$(cat "$pid_file")
+            kill -9 "$pid" 2>/dev/null || true
+            rm -f "$pid_file"
+        fi
+        pkill -9 -f "wireguard-quic.*$INTERFACE" 2>/dev/null || true
+    fi
+
+    sleep 0.3
+    cleanup_interface
+
+    echo "[#] $ACTUAL_INTERFACE is down" >&2
+}
+
+cmd_usage() {
+    cat <<EOF
+Usage: $PROGRAM [-f] up|down [ CONFIG_FILE | INTERFACE ]
+
+  CONFIG_FILE  WireGuard config file (e.g., /etc/wireguard/wg0.conf)
+  INTERFACE    Interface name (e.g., wg0), config read from /etc/wireguard/INTERFACE.conf
+
+Options:
+  -f, --foreground  Run wireguard-quic in foreground mode (shows logs, Ctrl+C to stop)
+  -h, --help        Show this help message
+
+Commands:
+  up      Start the WireGuard interface
+  down    Stop the WireGuard interface
+
+Examples:
+  $PROGRAM up wg0                    # Background mode (daemonized)
+  $PROGRAM -f up wg0                 # Foreground mode with logs
+  $PROGRAM down wg0
+  $PROGRAM up /etc/wireguard/wg0.conf
+
+Notes:
+  - Server mode requires RST packet blocking (handled automatically)
+  - QUICTCP config: /etc/wireguard/INTERFACE.quictcp.conf
+  - Background logs: /var/log/wireguard-quic-INTERFACE.log
+EOF
+}
+
+# Main
+
+# Parse options
+while [[ $# -gt 0 && "$1" == -* ]]; do
+    case "$1" in
+        -f|--foreground)
+            FOREGROUND=1
+            shift
+            ;;
+        -h|--help)
+            cmd_usage
+            exit 0
+            ;;
+        *)
+            die "Unknown option: $1"
+            ;;
+    esac
+done
+
+if [[ $# -lt 2 ]]; then
+    cmd_usage
+    exit 1
+fi
+
+ACTION="$1"
+shift
+
+# Determine config file and interface name
+if [[ -f "$1" ]]; then
+    CONFIG_FILE="$1"
+    INTERFACE="${CONFIG_FILE##*/}"
+    INTERFACE="${INTERFACE%.conf}"
+elif [[ -f "/etc/wireguard/$1.conf" ]]; then
+    CONFIG_FILE="/etc/wireguard/$1.conf"
+    INTERFACE="$1"
+else
+    die "Configuration file not found: $1 or /etc/wireguard/$1.conf"
+fi
+
+case "$ACTION" in
+    up)
+        cmd_up
+        ;;
+    down)
+        cmd_down
+        ;;
+    *)
+        cmd_usage
+        exit 1
+        ;;
+esac

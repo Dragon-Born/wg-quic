@@ -222,6 +222,10 @@ func main() {
 		return
 	}
 
+	// Set interface name for QUIC-TCP config file lookup
+	// This allows config files like /etc/wireguard/wg0.quictcp.conf to be found
+	conn.InterfaceName = interfaceName
+
 	device := device.NewDevice(tdev, conn.NewDefaultBind(), logger)
 
 	logger.Verbosef("Device started")
